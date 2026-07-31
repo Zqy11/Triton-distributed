@@ -235,4 +235,5 @@ if __name__ == "__main__":
         with group_profile(f"all_reduce_{os.environ['TORCHELASTIC_RUN_ID']}", args.profile, group=TP_GROUP):
             run_perf(DTYPE, method, warmup=args.warmup_iters, iters=args.iters)
 
-    finalize_distributed()
+    # finalize_distributed()
+    torch.distributed.destroy_process_group()

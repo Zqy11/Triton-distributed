@@ -295,4 +295,5 @@ if __name__ == "__main__":
     dist_print(f"torch #{RANK} {duration_ms_torch:0.3f} ms/iter", need_sync=True, allowed_ranks=list(range(WORLD_SIZE)))
 
     module.ctx.finalize()
-    finalize_distributed()
+    # finalize_distributed()
+    torch.distributed.destroy_process_group()

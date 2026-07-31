@@ -32,7 +32,8 @@ import triton
 import triton.language as tl
 import triton_dist.language as dl
 import triton_dist
-from triton_dist.language.extra.language_extra import __syncthreads, atomic_add, tid, st
+from triton_dist.language.extra.cuda.language_extra import __syncthreads, atomic_add, tid, st, multimem_ld_reduce_v4, st_v4_b32
+from triton.language.extra.cuda.utils import num_warps
 from triton_dist.kernels.nvidia.common_ops import barrier_on_this_grid, barrier_all_intra_node_atomic_cas_block
 from triton_dist.language.extra import libshmem_device
 from triton_dist.kernels.nvidia.moe_utils import calc_gather_scatter_index_triton, calc_gather_scatter_index_v2_triton, reduce_topk_non_tma_kernel
@@ -755,7 +756,7 @@ def reduce_topk_reduce_scatter_a2a_intra_node(grouped_gemm_out: torch.Tensor, ct
         **launch_cooperative_grid_options(),
     )
 
-    torch.sum(ctx.symm_reduce_scatter_buffer.view(ctx.num_ranks, -1, ctx.N), dim=0, out=out)
+    torch.sum(ctx.symm_reduce_scatter_buffer[:ntokens * ctx.N].view(ctx.num_ranks, -1, ctx.N), dim=0, out=out)
     return out
 
 
@@ -958,4 +959,267 @@ def run_moe_reduce_rs(x: torch.Tensor, weights: torch.Tensor, chosen_experts: to
         reduce_topk_reduce_scatter_intra_node(grouped_gemm_out, ctx, ntokens, n_chunks, out, block_size_m, block_size_n)
 
     current_stream.wait_stream(ctx.reduce_stream)
+    return out
+
+
+@triton_dist.jit(do_not_specialize=["rank"])
+def reduce_topk_reduce_scatter_fused_a2a_intra_node_kernel(
+    input_ptr,  # of shape [ntokens * topk, N] with stride [stride_m, stride_n]
+    # output
+    symm_reduced_topk_ptr,  # of shape [ntokens, N]. symm_buffer = sum(input, axis=1)
+    output_ptr,  # of shape [ntokens_per_rank, N]. final output
+    # args
+    ntokens,
+    N,
+    stride_m,
+    stride_n,
+    rank,
+    num_ranks: tl.constexpr,
+    # some barriers
+    gemm_done_flag_ptr,
+    grid_barrier_ptr,
+    symm_barrier_ptr,
+    N_CHUNKS,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    use_cooperative: tl.constexpr,
+):
+    """
+    Phase 1: reduce_topk + a2a scatter (same as reduce_topk_reduce_scatter_a2a_intra_node_kernel)
+    Phase 2: in-kernel equivalent of:
+        torch.sum(symm_buffer[:ntokens].view(num_ranks, ntokens_per_rank, N), dim=0, out=output)
+    """
+    pid = tl.program_id(axis=0)
+    npid = tl.num_programs(axis=0)
+    N_per_chunk = N // N_CHUNKS
+    N_per_chunk = tl.multiple_of(N_per_chunk, 16)
+    ntokens_per_rank = ntokens // num_ranks
+    n_blocks_per_chunk = tl.cdiv(N_per_chunk, BLOCK_SIZE_N)
+    m_blocks_per_rank = tl.cdiv(ntokens_per_rank, BLOCK_SIZE_M)
+    blocks_per_chunk_per_rank = m_blocks_per_rank * n_blocks_per_chunk
+
+    # Phase 1: reduce_topk + reduce_scatter (a2a pattern)
+    for n_chunk in tl.range(0, N_CHUNKS, step=1, loop_unroll_factor=1):
+        token = dl.wait(gemm_done_flag_ptr + n_chunk, 1, scope="gpu", semantic="acquire", waitValue=1)
+        offs_n_chunk = n_chunk * N_per_chunk * stride_n
+        input_this_chunk_ptr = dl.consume_token(input_ptr + offs_n_chunk, token)
+        reduced_topk_this_chunk_ptr = dl.consume_token(symm_reduced_topk_ptr + offs_n_chunk, token)
+
+        for i in range(pid, blocks_per_chunk_per_rank * num_ranks, npid):
+            peer = i // blocks_per_chunk_per_rank
+            src_segment = peer
+            dst_segment = rank
+            bid = i % blocks_per_chunk_per_rank
+
+            # TODO(houqi.1993) symm_at calls ld.const.b64. maybe we can put symm_at in shared memory
+            out_ptr = dl.symm_at(reduced_topk_this_chunk_ptr, peer)
+            out_ptr = tl.multiple_of(out_ptr, 16)
+
+            m_bid = bid // n_blocks_per_chunk
+            n_bid = bid % n_blocks_per_chunk
+            offs_m = m_bid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            mask_m = offs_m < ntokens_per_rank
+            offs_n = n_bid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            mask_n = offs_n < N_per_chunk
+            mask = mask_m[:, None] & mask_n[None, :]
+            offs_in = offs_m[:, None] * stride_m * TOPK + offs_n[None, :] * stride_n
+            offs_out = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+
+            input_ptrs = input_this_chunk_ptr + src_segment * ntokens_per_rank * TOPK * stride_m + offs_in
+            output_ptrs = out_ptr + dst_segment * ntokens_per_rank * stride_m + offs_out
+
+            reduced_topk = tl.load(input_ptrs, mask=mask)
+            for j in range(1, TOPK):
+                reduced_topk += tl.load(input_ptrs + j * stride_m, mask=mask)
+
+            tl.store(output_ptrs, reduced_topk, mask=mask)
+
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
+    if pid == 0:
+        barrier_all_intra_node_atomic_cas_block(rank, rank, num_ranks, symm_barrier_ptr)
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
+
+    # Phase 2: in-kernel torch.sum equivalent
+    n_blocks_n = tl.cdiv(N, BLOCK_SIZE_N)
+    total_blocks = m_blocks_per_rank * n_blocks_n
+    for i in range(pid, total_blocks, npid):
+        m_bid = i // n_blocks_n
+        n_bid = i % n_blocks_n
+        offs_m = m_bid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        mask_m = offs_m < ntokens_per_rank
+        offs_n = n_bid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        mask_n = offs_n < N
+        mask = mask_m[:, None] & mask_n[None, :]
+        offs = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+
+        # Accumulate across all num_ranks segments
+        val = tl.load(symm_reduced_topk_ptr + offs, mask=mask)
+        for r in range(1, num_ranks):
+            val += tl.load(symm_reduced_topk_ptr + r * ntokens_per_rank * stride_m + offs, mask=mask)
+
+        tl.store(output_ptr + offs, val, mask=mask)
+
+
+def reduce_topk_reduce_scatter_fused_a2a_intra_node(grouped_gemm_out: torch.Tensor, ctx: MoEReduceRSContext, ntokens,
+                                                   n_chunks: int, out: torch.Tensor, BLOCK_SIZE_M, BLOCK_SIZE_N):
+    """
+    Uses multimem_ld_reduce to perform the final reduction step in kernel,
+    eliminating the need for torch.sum on host.
+    """
+    has_nvlink_fullmesh = has_fullmesh_nvlink()
+    if not has_nvlink_fullmesh:
+        warnings.warn(
+            "reduce_topk_reduce_scatter_multimem_intra_node only works well on fullmesh nvlink. for PCI-e machines, try reduce_topk_reduce_scatter_ring_intra_node instead"
+        )
+    reduce_topk_reduce_scatter_fused_a2a_intra_node_kernel[(16, )](
+        grouped_gemm_out,
+        ctx.symm_reduce_scatter_buffer,
+        out,  # output directly
+        ntokens,
+        ctx.N,
+        ctx.N,  # stride_m
+        1,  # stride_n
+        ctx.rank,
+        ctx.num_ranks,
+        ctx.gemm_done_flag,
+        ctx.grid_barrier,
+        ctx.symm_barrier,
+        TOPK=ctx.topk,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        N_CHUNKS=n_chunks,
+        num_warps=32,
+        use_cooperative=True,
+        **launch_cooperative_grid_options(),
+    )
+    return out
+
+
+@triton_dist.jit(do_not_specialize=["rank"])
+def reduce_topk_reduce_scatter_multimem_intra_node_kernel(
+    input_ptr,  # of shape [ntokens * topk, N] with stride [stride_m, stride_n]
+    # output
+    symm_reduced_topk_ptr,  # of shape [ntokens, N]. symm_buffer = sum(input, axis=1)
+    output_ptr,  # of shape [ntokens_per_rank, N]. final output after multimem reduce
+    # args
+    ntokens,
+    N,
+    stride_m,
+    stride_n,
+    rank,
+    num_ranks: tl.constexpr,
+    # some barriers
+    gemm_done_flag_ptr,
+    grid_barrier_ptr,
+    symm_barrier_ptr,
+    N_CHUNKS,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    use_cooperative: tl.constexpr,
+):
+    """
+    Phase 1: reduce_topk - each rank only writes to its own segment in symm_buffer
+             Each rank processes the tokens it owns (based on reduce_scatter partition)
+    Phase 2: use multimem_ld_reduce_v4 to read from all ranks' symm_buffer and reduce
+             This completes the reduce_scatter operation
+    """
+    pid = tl.program_id(axis=0)
+    npid = tl.num_programs(axis=0)
+    thread_idx = tid(0)
+    block_dim = num_warps() * 32
+    N_per_chunk = N // N_CHUNKS
+    N_per_chunk = tl.multiple_of(N_per_chunk, 16)
+    ntokens_per_rank = ntokens // num_ranks
+    n_blocks_per_chunk = tl.cdiv(N_per_chunk, BLOCK_SIZE_N)
+    m_blocks_per_rank = tl.cdiv(ntokens_per_rank, BLOCK_SIZE_M)
+    blocks_per_chunk_per_rank = m_blocks_per_rank * n_blocks_per_chunk
+
+    # Phase 1: reduce_topk - each rank writes ALL segments to its own symm_buffer
+    # Each rank processes ALL segments and writes reduced_topk to corresponding positions
+    for n_chunk in tl.range(0, N_CHUNKS, step=1, loop_unroll_factor=1):
+        token = dl.wait(gemm_done_flag_ptr + n_chunk, 1, scope="gpu", semantic="acquire", waitValue=1)
+        offs_n_chunk = n_chunk * N_per_chunk * stride_n
+        input_this_chunk_ptr = dl.consume_token(input_ptr + offs_n_chunk, token)
+        reduced_topk_this_chunk_ptr = dl.consume_token(symm_reduced_topk_ptr + offs_n_chunk, token)
+
+        # Each rank processes all segments
+        for i in range(pid, blocks_per_chunk_per_rank * num_ranks, npid):
+            src_segment = i // blocks_per_chunk_per_rank  # which segment to read from input
+            bid = i % blocks_per_chunk_per_rank
+
+            m_bid = bid // n_blocks_per_chunk
+            n_bid = bid % n_blocks_per_chunk
+            offs_m = m_bid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+            mask_m = offs_m < ntokens_per_rank
+            offs_n = n_bid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            mask_n = offs_n < N_per_chunk
+            mask = mask_m[:, None] & mask_n[None, :]
+
+            # Input offset: src_segment in the input (topk expert outputs per token)
+            offs_in = offs_m[:, None] * stride_m * TOPK + offs_n[None, :] * stride_n
+            input_ptrs = input_this_chunk_ptr + src_segment * ntokens_per_rank * TOPK * stride_m + offs_in
+
+            # Output offset: src_segment position in this rank's symm_buffer
+            # Each rank writes ALL segments to its own buffer
+            offs_out = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
+            output_ptrs = reduced_topk_this_chunk_ptr + src_segment * ntokens_per_rank * stride_m + offs_out
+
+            # Reduce topk expert outputs
+            reduced_topk = tl.load(input_ptrs, mask=mask)
+            for j in range(1, TOPK):
+                reduced_topk += tl.load(input_ptrs + j * stride_m, mask=mask)
+
+            tl.store(output_ptrs, reduced_topk, mask=mask)
+
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
+    if pid == 0:
+        barrier_all_intra_node_atomic_cas_block(rank, rank, num_ranks, symm_barrier_ptr)
+    barrier_on_this_grid(grid_barrier_ptr, use_cooperative)
+
+    # Phase 2: multimem reduce
+    src_data_mc_ptr = libshmem_device.remote_mc_ptr(libshmem_device.NVSHMEMX_TEAM_NODE, symm_reduced_topk_ptr)
+    VEC_SIZE: tl.constexpr = 128 // symm_reduced_topk_ptr.dtype.element_ty.primitive_bitwidth
+
+    segment_start = rank * ntokens_per_rank * stride_m  # stride_m = N
+    total_vecs = ntokens_per_rank * N // VEC_SIZE
+
+    for idx in range(thread_idx + block_dim * pid, total_vecs, npid * block_dim):
+        val0, val1, val2, val3 = multimem_ld_reduce_v4(src_data_mc_ptr + segment_start + idx * VEC_SIZE)
+        st_v4_b32(output_ptr + idx * VEC_SIZE, val0, val1, val2, val3)
+
+
+def reduce_topk_reduce_scatter_multimem_intra_node(grouped_gemm_out: torch.Tensor, ctx: MoEReduceRSContext, ntokens,
+                                                   n_chunks: int, out: torch.Tensor, BLOCK_SIZE_M, BLOCK_SIZE_N):
+    """
+    Uses multimem_ld_reduce to perform the final reduction step in kernel,
+    eliminating the need for torch.sum on host.
+    """
+    has_nvlink_fullmesh = has_fullmesh_nvlink()
+    if not has_nvlink_fullmesh:
+        warnings.warn(
+            "reduce_topk_reduce_scatter_multimem_intra_node only works well on fullmesh nvlink. for PCI-e machines, try reduce_topk_reduce_scatter_ring_intra_node instead"
+        )
+    reduce_topk_reduce_scatter_multimem_intra_node_kernel[(16, )](
+        grouped_gemm_out,
+        ctx.symm_reduce_scatter_buffer,
+        out,  # output directly
+        ntokens,
+        ctx.N,
+        ctx.N,  # stride_m
+        1,  # stride_n
+        ctx.rank,
+        ctx.num_ranks,
+        ctx.gemm_done_flag,
+        ctx.grid_barrier,
+        ctx.symm_barrier,
+        TOPK=ctx.topk,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        N_CHUNKS=n_chunks,
+        num_warps=32,
+        use_cooperative=True,
+        **launch_cooperative_grid_options(),
+    )
     return out

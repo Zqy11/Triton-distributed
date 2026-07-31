@@ -38,6 +38,8 @@ from triton_dist.language.extra.cuda.language_extra import (__syncthreads, ld, s
                                                             multimem_st_v4, st_v4_b32, atomic_add)
 from triton_dist.kernels.nvidia.common_ops import barrier_on_this_grid
 from triton_dist.utils import is_nvshmem_multimem_supported
+from triton_dist.kernels.deepgemm import get_swizzled_block_idx
+import deep_gemm
 
 
 @dataclasses.dataclass
@@ -165,11 +167,13 @@ def consumer_all_reduce_kernel(
     src_data_mc_ptr = libshmem_device.remote_mc_ptr(libshmem_device.NVSHMEMX_TEAM_NODE, symm_input_ptr)
     if not USE_MULTIMEM_ST:
         for tile_id in range(pid, num_tiles, NUM_COMM_SMS):
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
+            # pid_m = tile_id // num_pid_n
+            # pid_n = tile_id % num_pid_n
+            pid_m, pid_n = get_swizzled_block_idx(tile_id, num_pid_m, num_pid_n)
             if thread_idx < world_size:
                 peer_gemm_barrier_ptr = dl.symm_at(gemm_barrier_ptr, thread_idx)
-                while ld(peer_gemm_barrier_ptr + tile_id, scope="sys", semantic="acquire") != 1:
+                gemm_barrier_idx = pid_m * num_pid_n + pid_n
+                while ld(peer_gemm_barrier_ptr + gemm_barrier_idx, scope="sys", semantic="acquire") != 1:
                     pass
             __syncthreads()
             tile_m = min(M - pid_m * BLOCK_SIZE_M, BLOCK_SIZE_M)
@@ -183,11 +187,13 @@ def consumer_all_reduce_kernel(
     else:
         symm_out_mc_ptr = libshmem_device.remote_mc_ptr(libshmem_device.NVSHMEMX_TEAM_NODE, symm_ar_out_ptr)
         for tile_id in range(pid + rank * NUM_COMM_SMS, num_tiles, NUM_COMM_SMS * world_size):
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
+            # pid_m = tile_id // num_pid_n
+            # pid_n = tile_id % num_pid_n
+            pid_m, pid_n = get_swizzled_block_idx(tile_id, num_pid_m, num_pid_n)
             if thread_idx < world_size:
                 peer_gemm_barrier_ptr = dl.symm_at(gemm_barrier_ptr, thread_idx)
-                while ld(peer_gemm_barrier_ptr + tile_id, scope="sys", semantic="acquire") != 1:
+                gemm_barrier_idx = pid_m * num_pid_n + pid_n
+                while ld(peer_gemm_barrier_ptr + gemm_barrier_idx, scope="sys", semantic="acquire") != 1:
                     pass
             __syncthreads()
 
@@ -219,8 +225,10 @@ def consumer_all_reduce_kernel(
     # it can be reset without any sync.
     for tile_id in range(pid + rank * NUM_COMM_SMS, num_tiles, NUM_COMM_SMS * world_size):
         peer_gemm_barrier_ptr = dl.symm_at(gemm_barrier_ptr, thread_idx)
+        pid_m, pid_n = get_swizzled_block_idx(tile_id, num_pid_m, num_pid_n)
+        gemm_barrier_idx = pid_m * num_pid_n + pid_n
         if thread_idx < world_size:
-            st(peer_gemm_barrier_ptr + tile_id, 0, scope="sys", semantic="relaxed")
+            st(peer_gemm_barrier_ptr + gemm_barrier_idx, 0, scope="sys", semantic="relaxed")
 
 
 @triton_dist.jit(do_not_specialize=[])
@@ -828,9 +836,55 @@ def allreduce_op(ctx: GemmARContext, c, gemm_config: triton.Config, TILE_MAP_LEV
     USE_MULTIMEM_ST = (ctx.all_reduce_method == OverlappingAllReduceMethod.Consumer_Multimem) and USE_MULTIMEM_ST
 
     gemm_barrier.fill_(1)
+    # gemm_barrier.reshape(-1)[:triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N)] = 1
     consumer_all_reduce(symm_c, symm_ar_out, ar_out, gemm_barrier, multi_st_barrier, BLOCK_SIZE_M=BLOCK_SIZE_M,
                         BLOCK_SIZE_N=BLOCK_SIZE_N, NUM_COMM_SMS=NUM_COMM_SMS, USE_MULTIMEM_ST=USE_MULTIMEM_ST,
                         BLOCK_SIZE_COMM=8192, TILE_MAP_LEVEL=TILE_MAP_LEVEL, all_reduce_method=ctx.all_reduce_method)
+
+    # out still in comm buffer, copy to user buffer
+    if USE_MULTIMEM_ST and copy_to_local:
+        ar_out.copy_(symm_ar_out.reshape(-1)[:M * N].reshape(M, N))
+    if USE_MULTIMEM_ST and not copy_to_local:
+        return symm_ar_out.reshape(-1)[:M * N].reshape(M, N)
+    return ar_out
+
+
+def deepgemm_allreduce_op(ctx: GemmARContext, a, b, gemm_config: triton.Config, copy_to_local=True, USE_MULTIMEM_ST=False):
+    M, N = a[0].shape[0], b[0].shape[0]
+    NUM_COMM_SMS = ctx.NUM_COMM_SMS
+    BLOCK_SIZE_M = gemm_config.all_kwargs()["BLOCK_SIZE_M"]
+    BLOCK_SIZE_N = gemm_config.all_kwargs()["BLOCK_SIZE_N"]
+    # add mask in `consumer_all_reduce` can remove this constraint
+    assert N % BLOCK_SIZE_N == 0
+    assert a[0].shape[1] == b[0].shape[1], "Incompatible dimensions"
+    assert a[0].dtype == b[0].dtype, "Incompatible dtypes"
+
+    symm_c = ctx.get_gemm_out_buf(a[0], b[0])
+    symm_ar_out = ctx.symm_ar_out_buf
+    gemm_barrier = ctx.gemm_barrier_buf
+    multi_st_barrier = ctx.multi_st_barrier_buf
+    ar_out = torch.empty((M, N), dtype=symm_c.dtype, device=symm_c.device)
+
+    USE_LD_REDUCE = (ctx.all_reduce_method == OverlappingAllReduceMethod.Consumer_Multimem)
+    USE_MULTIMEM_ST = (ctx.all_reduce_method == OverlappingAllReduceMethod.Consumer_Multimem) and USE_MULTIMEM_ST
+
+    current_stream = torch.cuda.current_stream()
+    ar_stream = ctx.ar_stream
+    ar_stream.wait_stream(current_stream)
+
+    if not USE_LD_REDUCE:  # Multimem kernel will reset barrier inside the ar kernel
+        nvshmem_barrier_all_on_stream(current_stream)
+        ctx.reset_all_barrier_buf()
+        nvshmem_barrier_all_on_stream(current_stream)
+
+    deep_gemm.fp8_gemm_nt(a, b, symm_c, c=None, disable_ue8m0_cast=True, recipe=None, enable_overlap=True, signal=ctx.gemm_barrier_buf)
+
+    with torch.cuda.stream(ar_stream):
+        consumer_all_reduce(symm_c, symm_ar_out, ar_out, gemm_barrier, multi_st_barrier, BLOCK_SIZE_M=BLOCK_SIZE_M,
+                            BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_COMM=8192, NUM_COMM_SMS=NUM_COMM_SMS,
+                            USE_MULTIMEM_ST=USE_MULTIMEM_ST, TILE_MAP_LEVEL=ctx.TILE_MAP_LEVEL,
+                            all_reduce_method=ctx.all_reduce_method)
+    current_stream.wait_stream(ar_stream)
 
     # out still in comm buffer, copy to user buffer
     if USE_MULTIMEM_ST and copy_to_local:

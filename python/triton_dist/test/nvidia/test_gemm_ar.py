@@ -35,6 +35,7 @@ from triton_dist.test.utils import assert_allclose
 from triton_dist.utils import (dist_print, initialize_distributed, nvshmem_barrier_all_on_stream, finalize_distributed,
                                sleep_async, rand_tensor)
 from triton_dist.layers.nvidia import GemmARLayer
+from triton_dist.deepgemm import get_best_config
 
 
 def _make_data(M):
@@ -232,15 +233,21 @@ if __name__ == "__main__":
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     NUM_GEMM_SMS = NUM_SMS - args.num_comm_sms
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
+    # BLOCK_SIZE_M = 128
+    # BLOCK_SIZE_N = 256
+    # BLOCK_SIZE_K = 64
+    blockconfig = get_best_config(args.M, args.N, args.K, NUM_GEMM_SMS)
+    BLOCK_SIZE_M = blockconfig.block_m
+    BLOCK_SIZE_N = blockconfig.block_n
+    BLOCK_SIZE_K = blockconfig.block_k
+    kNumMulticast = blockconfig.multicast_config.num_multicast
+    kIsMulticastOnA = blockconfig.multicast_config.is_multicast_on_a
     GROUP_SIZE_M = 1
     gemm_config = triton.Config(
         {
             'BLOCK_SIZE_M': BLOCK_SIZE_M, 'BLOCK_SIZE_N': BLOCK_SIZE_N, "BLOCK_SIZE_K": BLOCK_SIZE_K, "GROUP_SIZE_M":
             GROUP_SIZE_M, "NUM_GEMM_SMS": NUM_GEMM_SMS
-        }, num_stages=3, num_warps=8)
+        }, num_stages=2, num_warps=8)
     TILE_MAP_LEVEL = (args.row_wise == 1)
 
     gemm_ar_op = GemmARLayer(tp_group, args.M, args.N, args.K, input_dtype, output_dtype, LOCAL_WORLD_SIZE,
@@ -286,17 +293,31 @@ if __name__ == "__main__":
 
         print(f"RANK[{RANK}]: pass.")
         gemm_ar_op.finalize()
-        finalize_distributed()
+        # finalize_distributed()
+        torch.distributed.destroy_process_group()
         exit(0)
 
     # warm up
     A, weight, bias = _make_data(args.M)
+    A = torch.ones((args.M, local_K), device='cuda', dtype=torch.bfloat16)
+    weight = torch.ones((args.N, local_K), device='cuda', dtype=torch.bfloat16)
     if args.quant:
         ar_input = torch.matmul(A.to(torch.float32), weight.T.to(torch.float32)).to(torch.bfloat16)
     else:
         ar_input = torch.matmul(A, weight.T)
 
     x = gemm_ar_op.forward(A, weight, bias, scale_a, scale_b)
+
+    # deepgemm prepare
+    import deep_gemm
+    from deep_gemm.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    use_ue8m0 = False
+    a = per_token_cast_to_fp8(A, use_ue8m0=use_ue8m0)
+    b = per_block_cast_to_fp8(weight, use_ue8m0=use_ue8m0)
+    d = torch.empty((args.M, args.N), device='cuda', dtype=torch.bfloat16)
+    ref_d = (A.float() @ weight.float().t()).to(torch.bfloat16)
+    c = None
+    deep_gemm.set_num_sms(NUM_GEMM_SMS)
 
     nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
     torch.cuda.synchronize()
@@ -336,6 +357,13 @@ if __name__ == "__main__":
         torch.cuda.synchronize()
         sleep_async(100)
         nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
+        gemm_ar_op.ctx.gemm_barrier_buf.fill_(0)
+        _, dist_triton_deepgemm_ar_perf = perf_func(partial(gemm_ar_op.forward_deepgemm_ar, a, b),
+                                                    iters=args.iters, warmup_iters=args.warmup)
+
+        torch.cuda.synchronize()
+        sleep_async(100)
+        nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
         _, torch_ar_perf = perf_func(partial(torch.distributed.all_reduce, ar_input, group=tp_group), iters=args.iters,
                                      warmup_iters=args.warmup)
 
@@ -359,4 +387,5 @@ if __name__ == "__main__":
     dist_print(f"torch #{RANK}, total={torch_perf:0.4f}", need_sync=True, allowed_ranks=list(range(WORLD_SIZE)))
 
     gemm_ar_op.finalize()
-    finalize_distributed()
+    # finalize_distributed()
+    torch.distributed.destroy_process_group()

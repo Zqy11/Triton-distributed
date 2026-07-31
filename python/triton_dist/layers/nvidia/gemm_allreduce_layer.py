@@ -23,7 +23,7 @@
 #
 ################################################################################
 import torch
-from triton_dist.kernels.nvidia.gemm_allreduce import allreduce_op, gemm_op
+from triton_dist.kernels.nvidia.gemm_allreduce import allreduce_op, gemm_op, deepgemm_allreduce_op
 import triton
 from typing import Optional
 from triton_dist.utils import nvshmem_barrier_all_on_stream
@@ -140,4 +140,13 @@ class GemmARLayer(torch.nn.Module):
             copy_to_local=self.copy_to_local,
             USE_MULTIMEM_ST=self.USE_MULTIMEM_ST,
         )
+        return ar_out
+    
+    def forward_deepgemm_ar(self,
+                            input: torch.Tensor,
+                            weight: torch.Tensor,
+                            bias: Optional[torch.Tensor] = None,
+    ):
+        ar_out = deepgemm_allreduce_op(self.ctx, input, weight, self.gemm_config, copy_to_local=self.copy_to_local, 
+                                       USE_MULTIMEM_ST=self.USE_MULTIMEM_ST)
         return ar_out

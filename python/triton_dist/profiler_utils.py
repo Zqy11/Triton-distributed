@@ -222,6 +222,7 @@ class group_profile:
             ],
             record_shapes=True,
             with_stack=True,
+            acc_events=True,
         )
         self.group: torch.distributed.ProcessGroup = group or torch.distributed.group.WORLD
         self.merge_group = merge_group

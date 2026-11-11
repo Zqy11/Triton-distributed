@@ -26,8 +26,8 @@
 Test MegaMoE kernels — warp/block dispatch + FP8 group GEMM correctness & performance
 
 Usage:
-    python test_mega_moe.py -M 32 -N 6144 --perf
-    python test_mega_moe.py -M 32 -N 6144 --perf --profile
+    python python/triton_dist/test/nvidia/test_mega_moe.py -M 32 -N 6144 --perf
+    python python/triton_dist/test/nvidia/test_mega_moe.py -M 32 -N 6144 --perf --profile
 """
 
 import os

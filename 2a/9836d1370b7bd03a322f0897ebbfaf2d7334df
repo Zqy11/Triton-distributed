@@ -1,0 +1,14 @@
+python/triton_dist/test/nvidia/test_mega_moe.py
+  h_2f18919d5801d9 29-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2a9836d1370b7bd03a322f0897ebbfaf2d7334df",
+  "prompts": {},
+  "humans": {
+    "h_2f18919d5801d9": {
+      "author": "Zqy11 <841971412@qq.com>"
+    }
+  }
+}
